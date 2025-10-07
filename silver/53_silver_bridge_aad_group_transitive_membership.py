@@ -1,66 +1,62 @@
-# 53_silver_bridge_aad_group_transitive_membership
+# Databricks notebook: 53_silver_bridge_aad_group_transitive_membership (🟦 UPDATED & COMPLETE)
 # MAGIC %run ./00_config_and_common
+
 from pyspark.sql import functions as F
-from delta.tables import DeltaTable
 
-edges = spark.table(f"{CATALOG}.silver.bridge_aad_group_membership") \
-             .where("is_current = true") \
-             .select("aad_group_id", "member_object_id", "member_type")
+# ---------- load inputs ----------
+direct_mem = spark.table("silver.bridge_aad_group_membership").filter("is_current = true")
+aad_groups = spark.table("silver.dim_aad_group").filter("is_current = true")
+aad_users  = spark.table("silver.dim_user").filter("is_current = true")
 
-# iterative BFS to resolve nested groups to users
-users = edges.filter("member_type = 'User'") \
-             .selectExpr("aad_group_id", "member_object_id as user_object_id", "array(aad_group_id) as via_group_path")
+# optional: include historical baseline once (for first run)
+if spark.catalog.tableExists("silver.bridge_aad_group_membership_baseline"):
+    base_mem = spark.table("silver.bridge_aad_group_membership_baseline")
+    direct_mem = base_mem.unionByName(direct_mem, allowMissingColumns=True).dropDuplicates(["aad_group_id","member_object_id"])
 
-groups = edges.filter("member_type = 'Group'") \
-              .selectExpr("aad_group_id as parent", "member_object_id as child")
+# ---------- build transitive closure ----------
+# 1. separate user vs nested group memberships
+users_mem  = direct_mem.join(aad_users, direct_mem.member_object_id == aad_users.user_object_id, "inner")\
+                       .select(direct_mem.aad_group_id, F.col("member_object_id").alias("user_object_id"))
+nested_mem = direct_mem.join(aad_groups, direct_mem.member_object_id == aad_groups.aad_group_id, "inner")\
+                       .select(F.col("aad_group_id").alias("parent_group_id"),
+                               F.col("member_object_id").alias("child_group_id"))
 
-frontier = groups
-while True:
-    next_hop = (frontier.alias("f")
-                .join(groups.alias("g"), F.col("f.child") == F.col("g.parent"), "inner")
-                .select(F.col("f.parent").alias("parent"), F.col("g.child").alias("child"))
-                .distinct())
-    new_edges = next_hop.exceptAll(frontier)
-    if new_edges.count() == 0:
-        break
-    frontier = frontier.union(new_edges).distinct()
+# 2. iteratively expand nested groups until no new users found
+expanded = users_mem
+level = 0
+new_links = nested_mem
+while new_links.count() > 0:
+    level += 1
+    # join child group -> its user members
+    child_users = (new_links
+        .join(users_mem, new_links.child_group_id == users_mem.aad_group_id, "inner")
+        .select(new_links.parent_group_id.alias("aad_group_id"), "user_object_id"))
+    expanded = expanded.unionByName(child_users).dropDuplicates(["aad_group_id","user_object_id"])
+    # find next nesting level
+    new_links = (new_links
+        .join(nested_mem, new_links.child_group_id == nested_mem.parent_group_id, "inner")
+        .select(nested_mem.parent_group_id.alias("parent_group_id"), nested_mem.child_group_id.alias("child_group_id"))
+        .dropDuplicates())
 
-deep_users = (frontier.alias("f")
-              .join(edges.filter("member_type = 'User'").alias("u"),
-                    F.col("f.child") == F.col("u.aad_group_id"))
-              .select(F.col("f.parent").alias("aad_group_id"),
-                      F.col("u.member_object_id").alias("user_object_id"))
-              .distinct()
-              .withColumn("via_group_path", F.array(F.col("aad_group_id"), F.col("user_object_id"))))
+print(f"Transitive expansion completed, levels={level}")
 
-all_users = users.unionByName(deep_users).distinct() \
-                 .withColumn("valid_from", F.current_timestamp()) \
-                 .withColumn("source_run_id", F.lit("transitive_calc"))
+# ---------- prepare final output ----------
+result = (expanded
+          .withColumn("valid_from", F.current_timestamp())
+          .withColumn("valid_to", F.lit(None).cast("timestamp"))
+          .withColumn("is_current", F.lit(True))
+          .dropDuplicates(["aad_group_id","user_object_id"]))
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {CATALOG}.silver.bridge_aad_group_transitive_membership (
+spark.sql("""
+CREATE TABLE IF NOT EXISTS silver.bridge_aad_group_transitive_membership (
   aad_group_id STRING,
   user_object_id STRING,
-  via_group_path ARRAY<STRING>,
   valid_from TIMESTAMP,
   valid_to TIMESTAMP,
-  is_current BOOLEAN,
-  source_run_id STRING
+  is_current BOOLEAN
 ) USING delta
 """)
 
-target = DeltaTable.forName(spark, f"{CATALOG}.silver.bridge_aad_group_transitive_membership")
-(target.alias("t")
- .merge(all_users.alias("s"),
-        "t.aad_group_id = s.aad_group_id AND t.user_object_id = s.user_object_id AND t.is_current = true")
- .whenMatchedUpdate(set={"valid_to": F.current_timestamp(), "is_current": F.lit(False)})
- .whenNotMatchedInsert(values={
-     "aad_group_id": "s.aad_group_id",
-     "user_object_id": "s.user_object_id",
-     "via_group_path": "s.via_group_path",
-     "valid_from": "s.valid_from",
-     "valid_to": F.lit(None).cast("timestamp"),
-     "is_current": F.lit(True),
-     "source_run_id": "s.source_run_id"
- }).execute()
-)
+result.write.mode("overwrite").saveAsTable("silver.bridge_aad_group_transitive_membership")
+
+print(f"Wrote {result.count()} transitive memberships to silver.bridge_aad_group_transitive_membership")
